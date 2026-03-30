@@ -1,0 +1,12 @@
+{
+  "name": "kk-workflow-engine",
+  "version": "1.0.0",
+  "description": "Shared n8n workflow form renderer and execution hook for KK projects",
+  "type": "module",
+  "main": "src/index.js",
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "keywords": ["n8n", "workflow", "react", "hook"],
+  "private": true
+}
