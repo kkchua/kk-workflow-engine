@@ -9,20 +9,16 @@ import { adaptSchema, initValues, validateValues, buildPayload } from "./SchemaA
  *
  * @param {object} opts
  * @param {string}   opts.token            - JWT auth token (passed as Bearer header)
- * @param {string}   opts.workflowName     - selected workflow name (null to reset)
+ * @param {string}   opts.workflowName     - workflow_key (e.g. 'n8n/product-shot')
  * @param {string}   opts.apiUrl           - PA backend base URL, e.g. import.meta.env.VITE_API_URL
- * @param {string}   opts.app              - app context tag prefix, e.g. 'portfolio' or 'pa-admin'
- * @param {string}   opts.role             - role tag suffix, e.g. 'public' or 'admin'
  * @param {Function} opts.executionAdapter - optional async fn(name, payload, {token, testMode})
- *                                          returning a result object, or null to use default n8n trigger
+ *                                          returning a result object, or null to use agent-studio
  * @param {Function} opts.uploadFn         - async fn(file) => url (for file upload fields)
  */
 export function useWorkflowEngine({
   token,
   workflowName,
   apiUrl = "",
-  app = "pa-admin",
-  role = "admin",
   executionAdapter,
   uploadFn,
 } = {}) {
@@ -57,7 +53,9 @@ export function useWorkflowEngine({
     setResult(null);
     setValidationError("");
 
-    const url = `${apiUrl}/api/v1/n8n/schema/${encodeURIComponent(workflowName)}?app=${app}&role=${role}`;
+    // workflowName is the workflow_key (e.g. "n8n/product-shot").
+    // Agent-studio uses a {workflow_key:path} route that captures slashes, so no encoding needed.
+    const url = `${apiUrl}/api/v1/agent-studio/workflows/${workflowName}`;
     fetch(url, { headers: authHeaders() })
       .then(async (r) => {
         const json = await r.json();
@@ -65,7 +63,22 @@ export function useWorkflowEngine({
         return json;
       })
       .then((raw) => {
-        const v1 = adaptSchema(raw);
+        // Agent-studio returns: {workflow_key, name, description, schema: {fields: [...], webhookPath}, ...}
+        // adaptSchema() expects: {name, workflow_key, description, webhookPath, params: {fieldName: {...}}}
+        const rawSchema = raw.schema || {};
+        const params = {};
+        (rawSchema.fields || []).forEach(({ name, ...meta }) => {
+          params[name] = meta;
+        });
+        const normalized = {
+          name: raw.name,
+          workflow_key: raw.workflow_key,
+          description: raw.description || "",
+          webhookPath: rawSchema.webhookPath || null,
+          submitUrl: null,
+          params,
+        };
+        const v1 = adaptSchema(normalized);
         setSchema(v1);
         setValues(initValues(v1));
       })
@@ -74,7 +87,7 @@ export function useWorkflowEngine({
         setSchema(null);
       })
       .finally(() => setLoadingSchema(false));
-  }, [workflowName, token, apiUrl, app, role]);
+  }, [workflowName, token, apiUrl]);
 
   const onChange = (name, value) => {
     setValues((v) => ({ ...v, [name]: value }));
@@ -106,20 +119,7 @@ export function useWorkflowEngine({
     setLoading(true);
     setResult(null);
     try {
-      // Priority 1: If workflow declares a direct backend submit URL, POST there
-      if (schema.submitUrl) {
-        const r = await fetch(`${apiUrl}${schema.submitUrl}`, {
-          method: "POST",
-          headers: authHeaders(),
-          body: JSON.stringify(payload),
-        });
-        const data = await r.json();
-        if (!r.ok) throw data;
-        setResult({ success: true, data });
-        return;
-      }
-
-      // Priority 2: Custom execution adapter (legacy / custom routing)
+      // Priority 1: Custom execution adapter (legacy / custom routing)
       if (executionAdapter) {
         const adapterResult = await executionAdapter(workflowName, payload, {
           token,
@@ -131,16 +131,31 @@ export function useWorkflowEngine({
         }
       }
 
-      // Priority 3: Default — POST to /api/v1/n8n/trigger/{workflow}
-      const triggerUrl = `${apiUrl}/api/v1/n8n/trigger/${encodeURIComponent(workflowName)}?app=${app}&role=${role}`;
-      const r = await fetch(triggerUrl, {
+      // Priority 2: Default — POST to /api/v1/agent-studio/execute
+      const r = await fetch(`${apiUrl}/api/v1/agent-studio/execute`, {
         method: "POST",
         headers: authHeaders(),
-        body: JSON.stringify({ data: payload, test_mode: testMode }),
+        body: JSON.stringify({
+          workflow_key: workflowName,
+          inputs: payload,
+          test_mode: testMode,
+        }),
       });
       const data = await r.json();
       if (!r.ok) throw data;
-      setResult({ success: true, data });
+
+      // Normalize result: agent-studio returns {success, job_id, status, message} at top level.
+      // Wrap in data so WorkflowRenderer.ResultData (reads data.message + data.jobId) works.
+      setResult({
+        success: true,
+        data: {
+          jobId: data.job_id,
+          job_id: data.job_id,
+          message: data.message,
+          status: data.status,
+          estimated_time: data.estimated_time,
+        },
+      });
     } catch (e) {
       setResult({
         success: false,
